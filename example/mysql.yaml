@@ -9,4 +9,3 @@ spec:
   passwordSecretName: mydb-auth
   storageSize: 10Gi
   port: 3306
-  
