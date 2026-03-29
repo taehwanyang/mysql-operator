@@ -1,19 +1,3 @@
-/*
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -28,13 +12,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dbv1alpha1 "github.com/taehwanyang/mysql-operator/api/v1alpha1"
 )
 
-// MySQLReconciler reconciles a MySQL object
 type MySQLReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -48,16 +32,6 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the MySQL object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 
 func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var mysql dbv1alpha1.MySQL
@@ -95,7 +69,7 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcilePrimaryInitConfigMap(ctx, &mysql); err != nil {
+	if err := r.reconcilePrimaryBootstrapConfigMap(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -111,7 +85,7 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	if err := r.updateStatus(ctx, &mysql, "Pending", "all required secrets and services found", 0); err != nil {
+	if err := r.updateStatus(ctx, &mysql, "Running", "all required secrets and services found", 0); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -240,7 +214,7 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 				},
 				Spec: corev1.PodSpec{
 					InitContainers: []corev1.Container{
-						r.mysqlConfigInitContainer(mysql),
+						r.mysqlConfigInitContainer(),
 					},
 					Containers: []corev1.Container{
 						{
@@ -275,8 +249,34 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 									MountPath: "/etc/mysql/conf.d",
 								},
 								{
-									Name:      "primary-init",
-									MountPath: "/docker-entrypoint-initdb.d",
+									Name:      "root-secret",
+									MountPath: "/etc/mysql-secrets/root",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "app-secret",
+									MountPath: "/etc/mysql-secrets/app",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "repl-secret",
+									MountPath: "/etc/mysql-secrets/repl",
+									ReadOnly:  true,
+								},
+							},
+						},
+						{
+							Name:  "primary-bootstrap",
+							Image: mysql.Spec.Image,
+							Command: []string{
+								"sh",
+								"-c",
+								`/opt/bootstrap/bootstrap-primary.sh && tail -f /dev/null`,
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "primary-bootstrap",
+									MountPath: "/opt/bootstrap",
 								},
 								{
 									Name:      "root-secret",
@@ -329,22 +329,22 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 							},
 						},
 						{
-							Name: "replication-bootstrap",
+							Name: "primary-bootstrap",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: mysql.Name + "-replication-bootstrap",
+										Name: mysql.Name + "-primary-bootstrap",
 									},
 									DefaultMode: func() *int32 { m := int32(0755); return &m }(),
 								},
 							},
 						},
 						{
-							Name: "primary-init",
+							Name: "replication-bootstrap",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: mysql.Name + "-primary-init",
+										Name: mysql.Name + "-replication-bootstrap",
 									},
 									DefaultMode: func() *int32 { m := int32(0755); return &m }(),
 								},
@@ -417,25 +417,34 @@ func (r *MySQLReconciler) reconcilePodRoles(
 	}
 
 	for i := range podList.Items {
-		pod := &podList.Items[i]
+		name := podList.Items[i].Name
 
 		expectedRole := "replica"
-		if pod.Name == fmt.Sprintf("%s-0", mysql.Name) {
+		if name == fmt.Sprintf("%s-0", mysql.Name) {
 			expectedRole = "primary"
 		}
 
-		if pod.Labels == nil {
-			pod.Labels = map[string]string{}
-		}
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var latest corev1.Pod
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: mysql.Namespace,
+			}, &latest); err != nil {
+				return client.IgnoreNotFound(err)
+			}
 
-		if pod.Labels["role"] == expectedRole {
-			continue
-		}
+			if latest.Labels == nil {
+				latest.Labels = map[string]string{}
+			}
+			if latest.Labels["role"] == expectedRole {
+				return nil
+			}
 
-		updated := pod.DeepCopy()
-		updated.Labels["role"] = expectedRole
-
-		if err := r.Update(ctx, updated); err != nil {
+			base := latest.DeepCopy()
+			latest.Labels["role"] = expectedRole
+			return r.Patch(ctx, &latest, client.MergeFrom(base))
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -503,21 +512,22 @@ echo "replica bootstrap complete"
 	return r.applyOwnedConfigMap(ctx, mysql, cm)
 }
 
-func (r *MySQLReconciler) reconcilePrimaryInitConfigMap(
+func (r *MySQLReconciler) reconcilePrimaryBootstrapConfigMap(
 	ctx context.Context,
 	mysql *dbv1alpha1.MySQL,
 ) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      mysql.Name + "-primary-init",
+			Name:      mysql.Name + "-primary-bootstrap",
 			Namespace: mysql.Namespace,
 		},
 		Data: map[string]string{
-			"01-primary-init.sh": `#!/bin/sh
+			"bootstrap-primary.sh": `#!/bin/sh
 set -eu
 
 ordinal=${HOSTNAME##*-}
 if [ "$ordinal" -ne 0 ]; then
+  echo "not primary pod, skip primary bootstrap"
   exit 0
 fi
 
@@ -525,26 +535,27 @@ APP_PASSWORD="$(cat /etc/mysql-secrets/app/password)"
 REPL_PASSWORD="$(cat /etc/mysql-secrets/repl/password)"
 ROOT_PASSWORD="$(cat /etc/mysql-secrets/root/password)"
 
-echo "waiting for mysql..."
-
+echo "waiting for local mysql..."
 until mysqladmin ping -h 127.0.0.1 -uroot -p"${ROOT_PASSWORD}" --silent; do
-  sleep 2
+  sleep 3
 done
 
-echo "mysql ready, running init..."
-
-mysql -uroot -p"${ROOT_PASSWORD}" <<EOSQL
+echo "configuring primary..."
+mysql -h 127.0.0.1 -uroot -p"${ROOT_PASSWORD}" <<EOSQL
 CREATE DATABASE IF NOT EXISTS appdb;
+
 CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY '${APP_PASSWORD}';
+ALTER USER 'appuser'@'%' IDENTIFIED BY '${APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON appdb.* TO 'appuser'@'%';
 
 CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}';
+ALTER USER 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
 
 FLUSH PRIVILEGES;
 EOSQL
 
-echo "primary init done"
+echo "primary bootstrap complete"
 `,
 		},
 	}
@@ -557,7 +568,6 @@ func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&dbv1alpha1.MySQL{}).
 		Owns(&corev1.Service{}).
 		Owns(&appsv1.StatefulSet{}).
-		Owns(&corev1.Pod{}).
 		Complete(r)
 }
 
@@ -630,7 +640,7 @@ func (r *MySQLReconciler) applyOwnedService(
 	return r.Create(ctx, desired)
 }
 
-func (r *MySQLReconciler) mysqlConfigInitContainer(mysql *dbv1alpha1.MySQL) corev1.Container {
+func (r *MySQLReconciler) mysqlConfigInitContainer() corev1.Container {
 	return corev1.Container{
 		Name:  "mysql-config-init",
 		Image: "busybox:1.36",
@@ -643,6 +653,7 @@ ordinal=${HOSTNAME##*-}
 cat > /mnt/conf.d/server-id.cnf <<EOF
 [mysqld]
 server-id=$((100 + ordinal))
+bind-address=0.0.0.0
 log-bin=mysql-bin
 binlog_format=ROW
 gtid_mode=ON
