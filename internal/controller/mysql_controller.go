@@ -47,6 +47,7 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -107,6 +108,14 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	// 8. pod role label 보장
 	if err := r.reconcilePodRoles(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcilePrimaryInitConfigMap(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileReplicationConfigMap(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -292,6 +301,40 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 									Name:      "mysql-config",
 									MountPath: "/etc/mysql/conf.d",
 								},
+								{
+									Name:      "primary-init",
+									MountPath: "/docker-entrypoint-initdb.d",
+								},
+								{
+									Name:      "repl-secret",
+									MountPath: "/etc/mysql-secrets/repl",
+									ReadOnly:  true,
+								},
+							},
+						},
+						{
+							Name:  "replication-bootstrap",
+							Image: mysql.Spec.Image,
+							Command: []string{
+								"sh",
+								"-c",
+								`/opt/bootstrap/bootstrap-replication.sh && tail -f /dev/null`,
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "replication-bootstrap",
+									MountPath: "/opt/bootstrap",
+								},
+								{
+									Name:      "root-secret",
+									MountPath: "/etc/mysql-secrets/root",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "repl-secret",
+									MountPath: "/etc/mysql-secrets/repl",
+									ReadOnly:  true,
+								},
 							},
 						},
 					},
@@ -300,6 +343,44 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 							Name: "mysql-config",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "replication-bootstrap",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: mysql.Name + "-replication-bootstrap",
+									},
+									DefaultMode: func() *int32 { m := int32(0755); return &m }(),
+								},
+							},
+						},
+						{
+							Name: "primary-init",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: mysql.Name + "-primary-init",
+									},
+									DefaultMode: func() *int32 { m := int32(0755); return &m }(),
+								},
+							},
+						},
+						{
+							Name: "root-secret",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: mysql.Spec.RootPasswordSecretName,
+								},
+							},
+						},
+						{
+							Name: "repl-secret",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: mysql.Spec.ReplPasswordSecretName,
+								},
 							},
 						},
 					},
@@ -369,6 +450,98 @@ func (r *MySQLReconciler) reconcilePodRoles(
 	}
 
 	return nil
+}
+
+func (r *MySQLReconciler) reconcileReplicationConfigMap(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mysql.Name + "-replication-bootstrap",
+			Namespace: mysql.Namespace,
+		},
+		Data: map[string]string{
+			"bootstrap-replication.sh": fmt.Sprintf(`#!/bin/sh
+set -eu
+
+ordinal=${HOSTNAME##*-}
+
+if [ "$ordinal" -eq 0 ]; then
+  echo "primary pod, skip replica bootstrap"
+  exit 0
+fi
+
+ROOT_PASSWORD="$(cat /etc/mysql-secrets/root/password)"
+REPL_PASSWORD="$(cat /etc/mysql-secrets/repl/password)"
+
+PRIMARY_HOST="%s-0.%s"
+MYSQL_PORT="%d"
+
+echo "waiting for local mysql..."
+until mysqladmin ping -h 127.0.0.1 -uroot -p"${ROOT_PASSWORD}" --silent; do
+  sleep 3
+done
+
+echo "waiting for primary mysql..."
+until mysqladmin ping -h "${PRIMARY_HOST}" -P "${MYSQL_PORT}" -uroot -p"${ROOT_PASSWORD}" --silent; do
+  sleep 3
+done
+
+echo "configure replica..."
+mysql -h 127.0.0.1 -uroot -p"${ROOT_PASSWORD}" <<EOSQL
+STOP REPLICA;
+RESET REPLICA ALL;
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST='%s-0.%s',
+  SOURCE_PORT=%d,
+  SOURCE_USER='repl',
+  SOURCE_PASSWORD='${REPL_PASSWORD}',
+  SOURCE_AUTO_POSITION=1,
+  GET_SOURCE_PUBLIC_KEY=1;
+START REPLICA;
+SET GLOBAL read_only = ON;
+SET GLOBAL super_read_only = ON;
+EOSQL
+
+echo "replica bootstrap complete"
+`, mysql.Name, mysql.Name, mysql.Spec.Port, mysql.Name, mysql.Name, mysql.Spec.Port),
+		},
+	}
+
+	return r.applyOwnedConfigMap(ctx, mysql, cm)
+}
+
+func (r *MySQLReconciler) reconcilePrimaryInitConfigMap(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mysql.Name + "-primary-init",
+			Namespace: mysql.Namespace,
+		},
+		Data: map[string]string{
+			"01-create-repl-user.sh": `#!/bin/sh
+set -eu
+
+ordinal=${HOSTNAME##*-}
+if [ "$ordinal" -ne 0 ]; then
+  exit 0
+fi
+
+REPL_PASSWORD="$(cat /etc/mysql-secrets/repl/password)"
+
+cat > /docker-entrypoint-initdb.d/01-create-repl-user.sql <<EOSQL
+CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+FLUSH PRIVILEGES;
+EOSQL
+`,
+		},
+	}
+
+	return r.applyOwnedConfigMap(ctx, mysql, cm)
 }
 
 func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -477,4 +650,28 @@ EOF
 			},
 		},
 	}
+}
+
+func (r *MySQLReconciler) applyOwnedConfigMap(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+	desired *corev1.ConfigMap,
+) error {
+	var existing corev1.ConfigMap
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      desired.Name,
+		Namespace: desired.Namespace,
+	}, &existing)
+
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err := ctrl.SetControllerReference(mysql, desired, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, desired)
 }
