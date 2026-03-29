@@ -44,7 +44,7 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -74,22 +74,17 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// 2. PVC 보장
-	if err := r.reconcilePVC(ctx, &mysql); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 3. Service 보장
+	// 2. Service 보장
 	if err := r.reconcileService(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 4. Deployment 보장
-	if err := r.reconcileDeployment(ctx, &mysql); err != nil {
+	// 3. StatefulSet 보장
+	if err := r.reconcileStatefulSet(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. 상태 반영
+	// 4. 상태 반영
 	mysql.Status.Ready = true
 	mysql.Status.Phase = "Running"
 	mysql.Status.Service = mysql.Name
@@ -117,6 +112,7 @@ func (r *MySQLReconciler) reconcileService(ctx context.Context, mysql *dbv1alpha
 			Namespace: mysql.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
+			ClusterIP: "None",
 			Selector: map[string]string{
 				"app":   "mysql",
 				"mysql": mysql.Name,
@@ -136,47 +132,9 @@ func (r *MySQLReconciler) reconcileService(ctx context.Context, mysql *dbv1alpha
 	return r.Create(ctx, service)
 }
 
-func (r *MySQLReconciler) reconcilePVC(ctx context.Context, mysql *dbv1alpha1.MySQL) error {
-	var pvc corev1.PersistentVolumeClaim
-	err := r.Get(ctx, types.NamespacedName{Name: mysql.Name + "-data", Namespace: mysql.Namespace}, &pvc)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	quantity, err := resource.ParseQuantity(mysql.Spec.StorageSize)
-	if err != nil {
-		return err
-	}
-
-	pvc = corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      mysql.Name + "-data",
-			Namespace: mysql.Namespace,
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOnce,
-			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: quantity,
-				},
-			},
-		},
-	}
-
-	if err := ctrl.SetControllerReference(mysql, &pvc, r.Scheme); err != nil {
-		return err
-	}
-	return r.Create(ctx, &pvc)
-}
-
-func (r *MySQLReconciler) reconcileDeployment(ctx context.Context, mysql *dbv1alpha1.MySQL) error {
-	var deploy appsv1.Deployment
-	err := r.Get(ctx, types.NamespacedName{Name: mysql.Name, Namespace: mysql.Namespace}, &deploy)
+func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1alpha1.MySQL) error {
+	var sts appsv1.StatefulSet
+	err := r.Get(ctx, types.NamespacedName{Name: mysql.Name, Namespace: mysql.Namespace}, &sts)
 	if err == nil {
 		return nil
 	}
@@ -191,13 +149,19 @@ func (r *MySQLReconciler) reconcileDeployment(ctx context.Context, mysql *dbv1al
 
 	replicas := int32(1)
 
-	deploy = appsv1.Deployment{
+	quantity, err := resource.ParseQuantity(mysql.Spec.StorageSize)
+	if err != nil {
+		return err
+	}
+
+	sts = appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mysql.Name,
 			Namespace: mysql.Namespace,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: mysql.Name,
+			Replicas:    &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -211,7 +175,10 @@ func (r *MySQLReconciler) reconcileDeployment(ctx context.Context, mysql *dbv1al
 							Name:  "mysql",
 							Image: mysql.Spec.Image,
 							Ports: []corev1.ContainerPort{
-								{ContainerPort: mysql.Spec.Port},
+								{
+									Name:          "mysql",
+									ContainerPort: mysql.Spec.Port,
+								},
 							},
 							Env: []corev1.EnvVar{
 								{
@@ -253,13 +220,20 @@ func (r *MySQLReconciler) reconcileDeployment(ctx context.Context, mysql *dbv1al
 							},
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: mysql.Name + "-data",
-								},
+				},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							corev1.ReadWriteOnce,
+						},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: quantity,
 							},
 						},
 					},
@@ -268,16 +242,16 @@ func (r *MySQLReconciler) reconcileDeployment(ctx context.Context, mysql *dbv1al
 		},
 	}
 
-	if err := ctrl.SetControllerReference(mysql, &deploy, r.Scheme); err != nil {
+	if err := ctrl.SetControllerReference(mysql, &sts, r.Scheme); err != nil {
 		return err
 	}
-	return r.Create(ctx, &deploy)
+	return r.Create(ctx, &sts)
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dbv1alpha1.MySQL{}).
-		Named("mysql").
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
