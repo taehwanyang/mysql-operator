@@ -65,49 +65,33 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1. root secret 확인
 	_, err := r.getSecret(ctx, mysql.Namespace, mysql.Spec.RootPasswordSecretName)
 	if err != nil {
 		_ = r.updateStatus(ctx, &mysql, "Error", "root password secret not found", 0)
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// 2. app secret 확인
 	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.AppPasswordSecretName)
 	if err != nil {
 		_ = r.updateStatus(ctx, &mysql, "Error", "app password secret not found", 0)
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// 3. repl secret 확인
 	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.ReplPasswordSecretName)
 	if err != nil {
 		_ = r.updateStatus(ctx, &mysql, "Error", "replication password secret not found", 0)
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// 4. headless service 보장
 	if err := r.reconcileHeadlessService(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. primary service 보장
 	if err := r.reconcilePrimaryService(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 6. replica service 보장
 	if err := r.reconcileReplicaService(ctx, &mysql); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 7. statefulset 보장
-	if err := r.reconcileStatefulSet(ctx, &mysql); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 8. pod role label 보장
-	if err := r.reconcilePodRoles(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -116,6 +100,14 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	if err := r.reconcileReplicationConfigMap(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileStatefulSet(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcilePodRoles(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -262,25 +254,6 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 							},
 							Env: []corev1.EnvVar{
 								{
-									Name:  "MYSQL_DATABASE",
-									Value: mysql.Spec.Database,
-								},
-								{
-									Name:  "MYSQL_USER",
-									Value: mysql.Spec.AppUser,
-								},
-								{
-									Name: "MYSQL_PASSWORD",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: mysql.Spec.AppPasswordSecretName,
-											},
-											Key: "password",
-										},
-									},
-								},
-								{
 									Name: "MYSQL_ROOT_PASSWORD",
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
@@ -304,6 +277,16 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 								{
 									Name:      "primary-init",
 									MountPath: "/docker-entrypoint-initdb.d",
+								},
+								{
+									Name:      "root-secret",
+									MountPath: "/etc/mysql-secrets/root",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "app-secret",
+									MountPath: "/etc/mysql-secrets/app",
+									ReadOnly:  true,
 								},
 								{
 									Name:      "repl-secret",
@@ -380,6 +363,14 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
 									SecretName: mysql.Spec.ReplPasswordSecretName,
+								},
+							},
+						},
+						{
+							Name: "app-secret",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: mysql.Spec.AppPasswordSecretName,
 								},
 							},
 						},
@@ -522,7 +513,7 @@ func (r *MySQLReconciler) reconcilePrimaryInitConfigMap(
 			Namespace: mysql.Namespace,
 		},
 		Data: map[string]string{
-			"01-create-repl-user.sh": `#!/bin/sh
+			"01-primary-init.sh": `#!/bin/sh
 set -eu
 
 ordinal=${HOSTNAME##*-}
@@ -530,13 +521,30 @@ if [ "$ordinal" -ne 0 ]; then
   exit 0
 fi
 
+APP_PASSWORD="$(cat /etc/mysql-secrets/app/password)"
 REPL_PASSWORD="$(cat /etc/mysql-secrets/repl/password)"
+ROOT_PASSWORD="$(cat /etc/mysql-secrets/root/password)"
 
-cat > /docker-entrypoint-initdb.d/01-create-repl-user.sql <<EOSQL
+echo "waiting for mysql..."
+
+until mysqladmin ping -h 127.0.0.1 -uroot -p"${ROOT_PASSWORD}" --silent; do
+  sleep 2
+done
+
+echo "mysql ready, running init..."
+
+mysql -uroot -p"${ROOT_PASSWORD}" <<EOSQL
+CREATE DATABASE IF NOT EXISTS appdb;
+CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY '${APP_PASSWORD}';
+GRANT ALL PRIVILEGES ON appdb.* TO 'appuser'@'%';
+
 CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+
 FLUSH PRIVILEGES;
 EOSQL
+
+echo "primary init done"
 `,
 		},
 	}
