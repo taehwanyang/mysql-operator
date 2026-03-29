@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -45,6 +46,7 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -55,58 +57,71 @@ type MySQLReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+
 func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var mysql dbv1alpha1.MySQL
 	if err := r.Get(ctx, req.NamespacedName, &mysql); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1. Secret 확인
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      mysql.Spec.PasswordSecretName,
-		Namespace: mysql.Namespace,
-	}, &secret); err != nil {
-		mysql.Status.Ready = false
-		mysql.Status.Phase = "Error"
-		mysql.Status.Message = "password secret not found"
-		_ = r.Status().Update(ctx, &mysql)
+	// 1. root secret 확인
+	_, err := r.getSecret(ctx, mysql.Namespace, mysql.Spec.RootPasswordSecretName)
+	if err != nil {
+		_ = r.updateStatus(ctx, &mysql, "Error", "root password secret not found", 0)
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// 2. Service 보장
-	if err := r.reconcileService(ctx, &mysql); err != nil {
+	// 2. app secret 확인
+	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.AppPasswordSecretName)
+	if err != nil {
+		_ = r.updateStatus(ctx, &mysql, "Error", "app password secret not found", 0)
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+
+	// 3. repl secret 확인
+	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.ReplPasswordSecretName)
+	if err != nil {
+		_ = r.updateStatus(ctx, &mysql, "Error", "replication password secret not found", 0)
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+
+	// 4. headless service 보장
+	if err := r.reconcileHeadlessService(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 3. StatefulSet 보장
+	// 5. primary service 보장
+	if err := r.reconcilePrimaryService(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 6. replica service 보장
+	if err := r.reconcileReplicaService(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 7. statefulset 보장
 	if err := r.reconcileStatefulSet(ctx, &mysql); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 4. 상태 반영
-	mysql.Status.Ready = true
-	mysql.Status.Phase = "Running"
-	mysql.Status.Service = mysql.Name
-	mysql.Status.Message = "resources reconciled"
-	if err := r.Status().Update(ctx, &mysql); err != nil {
+	// 8. pod role label 보장
+	if err := r.reconcilePodRoles(ctx, &mysql); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.updateStatus(ctx, &mysql, "Pending", "all required secrets and services found", 0); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *MySQLReconciler) reconcileService(ctx context.Context, mysql *dbv1alpha1.MySQL) error {
-	var svc corev1.Service
-	err := r.Get(ctx, types.NamespacedName{Name: mysql.Name, Namespace: mysql.Namespace}, &svc)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	service := &corev1.Service{
+func (r *MySQLReconciler) reconcileHeadlessService(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mysql.Name,
 			Namespace: mysql.Namespace,
@@ -114,8 +129,7 @@ func (r *MySQLReconciler) reconcileService(ctx context.Context, mysql *dbv1alpha
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",
 			Selector: map[string]string{
-				"app":   "mysql",
-				"mysql": mysql.Name,
+				"app": mysql.Name,
 			},
 			Ports: []corev1.ServicePort{
 				{
@@ -125,16 +139,68 @@ func (r *MySQLReconciler) reconcileService(ctx context.Context, mysql *dbv1alpha
 			},
 		},
 	}
-
-	if err := ctrl.SetControllerReference(mysql, service, r.Scheme); err != nil {
-		return err
-	}
-	return r.Create(ctx, service)
+	return r.applyOwnedService(ctx, mysql, svc)
 }
 
-func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1alpha1.MySQL) error {
-	var sts appsv1.StatefulSet
-	err := r.Get(ctx, types.NamespacedName{Name: mysql.Name, Namespace: mysql.Namespace}, &sts)
+func (r *MySQLReconciler) reconcilePrimaryService(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mysql.Name + "-primary",
+			Namespace: mysql.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app":  mysql.Name,
+				"role": "primary",
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name: "mysql",
+					Port: mysql.Spec.Port,
+				},
+			},
+		},
+	}
+	return r.applyOwnedService(ctx, mysql, svc)
+}
+
+func (r *MySQLReconciler) reconcileReplicaService(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mysql.Name + "-replicas",
+			Namespace: mysql.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app":  mysql.Name,
+				"role": "replica",
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name: "mysql",
+					Port: mysql.Spec.Port,
+				},
+			},
+		},
+	}
+	return r.applyOwnedService(ctx, mysql, svc)
+}
+
+func (r *MySQLReconciler) reconcileStatefulSet(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	var existing appsv1.StatefulSet
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      mysql.Name,
+		Namespace: mysql.Namespace,
+	}, &existing)
 	if err == nil {
 		return nil
 	}
@@ -142,19 +208,21 @@ func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1a
 		return err
 	}
 
-	labels := map[string]string{
-		"app":   "mysql",
-		"mysql": mysql.Name,
-	}
-
-	replicas := int32(1)
-
 	quantity, err := resource.ParseQuantity(mysql.Spec.StorageSize)
 	if err != nil {
 		return err
 	}
 
-	sts = appsv1.StatefulSet{
+	replicas := mysql.Spec.Replicas
+	if replicas == 0 {
+		replicas = 3
+	}
+
+	labels := map[string]string{
+		"app": mysql.Name,
+	}
+
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mysql.Name,
 			Namespace: mysql.Namespace,
@@ -187,14 +255,14 @@ func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1a
 								},
 								{
 									Name:  "MYSQL_USER",
-									Value: mysql.Spec.User,
+									Value: mysql.Spec.AppUser,
 								},
 								{
 									Name: "MYSQL_PASSWORD",
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
 											LocalObjectReference: corev1.LocalObjectReference{
-												Name: mysql.Spec.PasswordSecretName,
+												Name: mysql.Spec.AppPasswordSecretName,
 											},
 											Key: "password",
 										},
@@ -205,9 +273,9 @@ func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1a
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
 											LocalObjectReference: corev1.LocalObjectReference{
-												Name: mysql.Spec.PasswordSecretName,
+												Name: mysql.Spec.RootPasswordSecretName,
 											},
-											Key: "rootPassword",
+											Key: "password",
 										},
 									},
 								},
@@ -242,16 +310,126 @@ func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, mysql *dbv1a
 		},
 	}
 
-	if err := ctrl.SetControllerReference(mysql, &sts, r.Scheme); err != nil {
+	if err := ctrl.SetControllerReference(mysql, sts, r.Scheme); err != nil {
 		return err
 	}
-	return r.Create(ctx, &sts)
+
+	return r.Create(ctx, sts)
+}
+
+func (r *MySQLReconciler) reconcilePodRoles(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+) error {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.InNamespace(mysql.Namespace),
+		client.MatchingLabels{"app": mysql.Name},
+	); err != nil {
+		return err
+	}
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+
+		expectedRole := "replica"
+		if pod.Name == fmt.Sprintf("%s-0", mysql.Name) {
+			expectedRole = "primary"
+		}
+
+		if pod.Labels == nil {
+			pod.Labels = map[string]string{}
+		}
+
+		if pod.Labels["role"] == expectedRole {
+			continue
+		}
+
+		updated := pod.DeepCopy()
+		updated.Labels["role"] = expectedRole
+
+		if err := r.Update(ctx, updated); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dbv1alpha1.MySQL{}).
-		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Pod{}).
 		Complete(r)
+}
+
+func (r *MySQLReconciler) getSecret(
+	ctx context.Context,
+	namespace string,
+	name string,
+) (*corev1.Secret, error) {
+	var secret corev1.Secret
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}, &secret)
+	if err != nil {
+		return nil, err
+	}
+	return &secret, nil
+}
+
+func (r *MySQLReconciler) updateStatus(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+	phase string,
+	message string,
+	readyReplicas int32,
+) error {
+	var latest dbv1alpha1.MySQL
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      mysql.Name,
+		Namespace: mysql.Namespace,
+	}, &latest); err != nil {
+		return err
+	}
+
+	if latest.Status.Phase == phase &&
+		latest.Status.Message == message &&
+		latest.Status.ReadyReplicas == readyReplicas {
+		return nil
+	}
+
+	latest.Status.Phase = phase
+	latest.Status.Message = message
+	latest.Status.ReadyReplicas = readyReplicas
+
+	return r.Status().Update(ctx, &latest)
+}
+
+func (r *MySQLReconciler) applyOwnedService(
+	ctx context.Context,
+	mysql *dbv1alpha1.MySQL,
+	desired *corev1.Service,
+) error {
+	var existing corev1.Service
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      desired.Name,
+		Namespace: desired.Namespace,
+	}, &existing)
+
+	if err == nil {
+		// 이미 있으면 지금 단계에서는 그냥 둠
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err := ctrl.SetControllerReference(mysql, desired, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, desired)
 }

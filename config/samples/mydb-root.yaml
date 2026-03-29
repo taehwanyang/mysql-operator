@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mydb-root
+type: Opaque
+stringData:
+  password: rootsecret

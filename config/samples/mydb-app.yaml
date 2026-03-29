@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mydb-app
+type: Opaque
+stringData:
+  password: supersecret

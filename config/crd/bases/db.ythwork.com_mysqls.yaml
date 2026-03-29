@@ -37,36 +37,65 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of MySQL
+            description: MySQLSpec defines the desired state of MySQL
             properties:
+              appPasswordSecretName:
+                description: Secret name containing app user password
+                type: string
+              appUser:
+                default: appuser
+                description: Application user name
+                type: string
               database:
+                default: appdb
+                description: Application database name
                 type: string
               image:
-                type: string
-              passwordSecretName:
+                default: mysql:8.0
+                description: MySQL container image
                 type: string
               port:
+                default: 3306
+                description: MySQL port
                 format: int32
+                minimum: 1
                 type: integer
-              storageSize:
+              replPasswordSecretName:
+                description: Secret name containing replication password
                 type: string
-              user:
+              replicas:
+                default: 3
+                description: |-
+                  Total number of MySQL pods
+                  primary 1 + replicas N
+                format: int32
+                minimum: 1
+                type: integer
+              rootPasswordSecretName:
+                description: Secret name containing root password
+                type: string
+              storageSize:
+                default: 10Gi
+                description: Storage size for each pod
                 type: string
             type: object
           status:
-            description: status defines the observed state of MySQL
+            description: MySQLStatus defines the observed state of MySQL
             properties:
               message:
                 type: string
               phase:
                 type: string
-              ready:
-                type: boolean
-              service:
+              primaryPod:
+                type: string
+              primaryService:
+                type: string
+              readyReplicas:
+                format: int32
+                type: integer
+              replicaService:
                 type: string
             type: object
-        required:
-        - spec
         type: object
     served: true
     storage: true
