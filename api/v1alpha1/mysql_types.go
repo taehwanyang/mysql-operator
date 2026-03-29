@@ -53,8 +53,8 @@ type MySQLStatus struct {
 	Message        string `json:"message,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 
 // MySQL is the Schema for the mysqls API
 type MySQL struct {
@@ -65,7 +65,7 @@ type MySQL struct {
 	Status MySQLStatus `json:"status,omitempty"`
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // MySQLList contains a list of MySQL
 type MySQLList struct {

@@ -39,21 +39,21 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	_, err := r.getSecret(ctx, mysql.Namespace, mysql.Spec.RootPasswordSecretName)
+	err := r.getSecret(ctx, mysql.Namespace, mysql.Spec.RootPasswordSecretName)
 	if err != nil {
-		_ = r.updateStatus(ctx, &mysql, "Error", "root password secret not found", 0)
+		_ = r.updateStatus(ctx, &mysql, "Error", "root password secret not found")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.AppPasswordSecretName)
+	err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.AppPasswordSecretName)
 	if err != nil {
-		_ = r.updateStatus(ctx, &mysql, "Error", "app password secret not found", 0)
+		_ = r.updateStatus(ctx, &mysql, "Error", "app password secret not found")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	_, err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.ReplPasswordSecretName)
+	err = r.getSecret(ctx, mysql.Namespace, mysql.Spec.ReplPasswordSecretName)
 	if err != nil {
-		_ = r.updateStatus(ctx, &mysql, "Error", "replication password secret not found", 0)
+		_ = r.updateStatus(ctx, &mysql, "Error", "replication password secret not found")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
@@ -85,7 +85,7 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	if err := r.updateStatus(ctx, &mysql, "Running", "all required secrets and services found", 0); err != nil {
+	if err := r.updateStatus(ctx, &mysql, "Running", "all required secrets and services found"); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -575,16 +575,16 @@ func (r *MySQLReconciler) getSecret(
 	ctx context.Context,
 	namespace string,
 	name string,
-) (*corev1.Secret, error) {
+) error {
 	var secret corev1.Secret
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      name,
 		Namespace: namespace,
 	}, &secret)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &secret, nil
+	return nil
 }
 
 func (r *MySQLReconciler) updateStatus(
@@ -592,7 +592,6 @@ func (r *MySQLReconciler) updateStatus(
 	mysql *dbv1alpha1.MySQL,
 	phase string,
 	message string,
-	readyReplicas int32,
 ) error {
 	var latest dbv1alpha1.MySQL
 	if err := r.Get(ctx, types.NamespacedName{
@@ -603,14 +602,12 @@ func (r *MySQLReconciler) updateStatus(
 	}
 
 	if latest.Status.Phase == phase &&
-		latest.Status.Message == message &&
-		latest.Status.ReadyReplicas == readyReplicas {
+		latest.Status.Message == message {
 		return nil
 	}
 
 	latest.Status.Phase = phase
 	latest.Status.Message = message
-	latest.Status.ReadyReplicas = readyReplicas
 
 	return r.Status().Update(ctx, &latest)
 }
