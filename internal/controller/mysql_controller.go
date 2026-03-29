@@ -238,6 +238,9 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						r.mysqlConfigInitContainer(mysql),
+					},
 					Containers: []corev1.Container{
 						{
 							Name:  "mysql",
@@ -285,6 +288,18 @@ func (r *MySQLReconciler) reconcileStatefulSet(
 									Name:      "data",
 									MountPath: "/var/lib/mysql",
 								},
+								{
+									Name:      "mysql-config",
+									MountPath: "/etc/mysql/conf.d",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "mysql-config",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},
@@ -432,4 +447,34 @@ func (r *MySQLReconciler) applyOwnedService(
 		return err
 	}
 	return r.Create(ctx, desired)
+}
+
+func (r *MySQLReconciler) mysqlConfigInitContainer(mysql *dbv1alpha1.MySQL) corev1.Container {
+	return corev1.Container{
+		Name:  "mysql-config-init",
+		Image: "busybox:1.36",
+		Command: []string{
+			"sh",
+			"-c",
+			`
+ordinal=${HOSTNAME##*-}
+
+cat > /mnt/conf.d/server-id.cnf <<EOF
+[mysqld]
+server-id=$((100 + ordinal))
+log-bin=mysql-bin
+binlog_format=ROW
+gtid_mode=ON
+enforce_gtid_consistency=ON
+log_replica_updates=ON
+EOF
+`,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "mysql-config",
+				MountPath: "/mnt/conf.d",
+			},
+		},
+	}
 }
